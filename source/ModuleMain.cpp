@@ -6,14 +6,12 @@ static YYTKInterface* g_ModuleInterface = nullptr;
 
 static const char* const VERSION = "1.2.0";
 static const char* const GML_SCRIPT_CREATE_NOTIFICATION = "gml_Script_create_notification";
-static const std::string FORECAST_ACCEPTED = "Notifications/Mods/Forecast/updatedForecast";
+static const std::string INCREASED_INTENSITY = "Notifications/Mods/IntenseSpells/increaseIntensity";
+static const std::string DECREASED_INTENSITY = "Notifications/Mods/IntenseSpells/decreaseIntensity";
 
 
-static int s_weather = -1;
-static bool rain_spell = false;
-// Valid values for weather are 0 for sunny, 1 for rainy, 2 for thunder, 3 special season weather. -1 "disables" the mod.
-std::set<int> weather_types = {-1, 0, 1, 2, 3};
-
+static int rain_days = 0;
+static int intensity = 0;
 
 // Taken from AnnaNomolys' StatueOfBoons mod
 void CreateNotification(std::string notification_localization_str, CInstance* Self, CInstance* Other)
@@ -47,31 +45,28 @@ RValue& UpdateClock(
 {
 	const auto original = reinterpret_cast<PFUNC_YYGMLScript>(MmGetHookTrampoline(g_ArSelfModule, "ClockUpdate"));
 	// This part is a modified version of the popup done by ArchieUwU in Time of Mistria
-	if (GetAsyncKeyState(VK_NEXT) & 1)
+	if (GetAsyncKeyState(VK_ADD) & 1)
 	{
-		// Attempt to get a number from the user.
-		RValue integer_result = g_ModuleInterface->CallBuiltin(
-			"get_integer",
-			{
-				"Please decide tomorrows weather.\r\n"
-				"(0 Sun, 1 Rain, 2 Thunder, 3 Special)\r\n",
-				s_weather
-			}
-		);
 
-		if (integer_result.m_Kind == VALUE_UNDEFINED || integer_result.m_Kind == VALUE_UNSET)
-			return Result;
+		CreateNotification(INCREASED_INTENSITY, Self, Other);
 
-		if (!weather_types.contains(integer_result.ToInt64()))
-		{
-			g_ModuleInterface->GetRunnerInterface().YYError(
-				"\r\nInvalid weather choose from a number from 0 to 3!\r\n"
+		intensity += 1;
+
+	}
+	else if (GetAsyncKeyState(VK_SUBTRACT) & 1)
+	{
+		if (intensity <= 0)
+			return original(
+				Self,
+				Other,
+				Result,
+				ArgumentCount,
+				Arguments
 			);
-		}
 
-		s_weather = static_cast<int16_t>(integer_result.ToInt64());
-		CreateNotification(FORECAST_ACCEPTED, Self, Other);
+		CreateNotification(DECREASED_INTENSITY, Self, Other);
 
+		intensity -= 1;
 	}
 	return original(
 		Self,
@@ -106,7 +101,7 @@ RValue& StartWeatherEvent(
 		);
 	}
 
-	if (s_weather == -1)
+	if (rain_days == 0)
 		return original(
 			Self,
 			Other,
@@ -115,11 +110,10 @@ RValue& StartWeatherEvent(
 			Arguments
 		);
 
-	RValue weather = s_weather;
+	RValue weather = 1;
 	Arguments[0] = &weather;
-
-	if (rain_spell)
-		rain_spell = false;
+	rain_days -= 1;
+	g_ModuleInterface->Print(CM_LIGHTGREEN, "Rainy days left: %i", rain_days);
 
 	return original(
 		Self,
@@ -167,7 +161,7 @@ RValue& WeatherTomorrow(
 		Arguments
 	);
 
-	if (s_weather == -1)
+	if (rain_days == 0)
 		return original(
 			Self,
 			Other,
@@ -176,12 +170,53 @@ RValue& WeatherTomorrow(
 			Arguments
 		);
 
-	Result = s_weather;
+	Result = 2;
 
 	//g_ModuleInterface->Print(CM_LIGHTGREEN, "gml_Script_weather_tomorrow: %i", ArgumentCount);
 	//g_ModuleInterface->Print(CM_LIGHTGREEN, "gml_Script_weather_tomorrow: %i", Result.ToInt64());
 
 	return Result;
+}
+
+void ModifyMana(CInstance* Self, CInstance* Other, int value)
+{
+	CScript* gml_script_modify_mana = nullptr;
+	g_ModuleInterface->GetNamedRoutinePointer(
+		"gml_Script_modify_mana@Ari@Ari",
+		(PVOID*)&gml_script_modify_mana
+	);
+
+	RValue result;
+	RValue mana_modifier = value;
+	RValue* mana_modifier_ptr = &mana_modifier;
+
+	gml_script_modify_mana->m_Functions->m_ScriptFunction(
+		Self,
+		Other,
+		result,
+		1,
+		{ &mana_modifier_ptr }
+	);
+}
+
+RValue GetCurrentMana(CInstance* Self, CInstance* Other)
+{
+	CScript* gml_script_get_mana = nullptr;
+	g_ModuleInterface->GetNamedRoutinePointer(
+		"gml_Script_get_mana@Ari@Ari",
+		(PVOID*)&gml_script_get_mana
+	);
+
+	RValue current_mana;
+	gml_script_get_mana->m_Functions->m_ScriptFunction(
+		Self,
+		Other,
+		current_mana,
+		0,
+		nullptr
+	);
+
+	return current_mana;
 }
 
 
@@ -214,16 +249,26 @@ RValue& CastSpellCallback(
 		ArgumentCount,
 		Arguments
 	);
+
+	RValue current_mana = GetCurrentMana((global_instance->GetRefMember("__ari"))->ToInstance(), Self);
+	
 	
 	if (Arguments[0]->ToInt64() == 3)
 	{
-		rain_spell = true;
-		s_weather = 1;
+		if (current_mana.ToInt64() < (4 + intensity))
+		{
+			CreateNotification(DECREASED_INTENSITY, Self, Other);
+			intensity = current_mana.ToInt64() - 4;
+			g_ModuleInterface->Print(CM_LIGHTGREEN, "Set intensity to: %i", intensity);
+		}
+		ModifyMana((global_instance->GetRefMember("__ari"))->ToInstance(), Self, static_cast<int>(-1 * intensity));
+		rain_days = (intensity + 1);
+		g_ModuleInterface->Print(CM_LIGHTGREEN, "It will rain for %i days. %i days come from the intensity of the casted spell.", rain_days, intensity);
 	}
 	//g_ModuleInterface->Print(CM_LIGHTGREEN, "castSpell: %i", ArgumentCount);
 	//g_ModuleInterface->Print(CM_LIGHTGREEN, "castSpell: %i", Arguments[0]->ToInt64());
 	
-	
+
 
 
 	return Result;
@@ -258,7 +303,6 @@ EXPORTED AurieStatus ModuleInitialize(
 		return last_status;
 	}
 
-	
 
 	CScript* start_weather_event = nullptr;
 	last_status = g_ModuleInterface->GetNamedRoutinePointer(
