@@ -1,39 +1,25 @@
-#include <YYToolkit/YYTK_Shared.hpp>
+﻿#include <YYToolkit/YYTK_Shared.hpp>
 #include <set>
+#include <fstream>
+#include <sstream>
+
+#include "Ari.h"
+#include "InfoToastsMenu.h"
+#include "LoggingUtility.h"
 using namespace Aurie;
 using namespace YYTK;
-static YYTKInterface* g_ModuleInterface = nullptr;
 
-static const char* const VERSION = "1.2.0";
-static const char* const GML_SCRIPT_CREATE_NOTIFICATION = "gml_Script_create_notification";
+const char* const VERSION = "2.0.2";
+const char* const MOD_NAME = "Intense Spells";
 static const std::string INCREASED_INTENSITY = "Notifications/Mods/IntenseSpells/increaseIntensity";
 static const std::string DECREASED_INTENSITY = "Notifications/Mods/IntenseSpells/decreaseIntensity";
 
-
+static int lastSelectedItem = -1;
+static int lastPage = 1;
+static bool isFirstPageSelect = true;
 static int rain_days = 0;
 static int intensity = 0;
-
-// Taken from AnnaNomolys' StatueOfBoons mod
-void CreateNotification(std::string notification_localization_str, CInstance* Self, CInstance* Other)
-{
-	CScript* gml_script_create_notification = nullptr;
-	g_ModuleInterface->GetNamedRoutinePointer(
-		GML_SCRIPT_CREATE_NOTIFICATION,
-		(PVOID*)&gml_script_create_notification
-	);
-
-	RValue result;
-	RValue notification = RValue(notification_localization_str);
-	RValue* notification_ptr = &notification;
-	gml_script_create_notification->m_Functions->m_ScriptFunction(
-		Self,
-		Other,
-		result,
-		1,
-		{ &notification_ptr }
-	);
-}
-
+static std::vector<RValue> collectedStructs;
 
 RValue& UpdateClock(
 	IN CInstance* Self,
@@ -48,7 +34,7 @@ RValue& UpdateClock(
 	if (GetAsyncKeyState(VK_ADD) & 1)
 	{
 
-		CreateNotification(INCREASED_INTENSITY, Self, Other);
+		InfoToastsMenu::InfoToastsMenu::CreateNotification(INCREASED_INTENSITY);
 
 		intensity += 1;
 
@@ -64,7 +50,7 @@ RValue& UpdateClock(
 				Arguments
 			);
 
-		CreateNotification(DECREASED_INTENSITY, Self, Other);
+		InfoToastsMenu::InfoToastsMenu::CreateNotification(DECREASED_INTENSITY);
 
 		intensity -= 1;
 	}
@@ -89,18 +75,6 @@ RValue& StartWeatherEvent(
 {
 	const auto original = reinterpret_cast<PFUNC_YYGMLScript>(MmGetHookTrampoline(g_ArSelfModule, "StartWeatherEvent"));
 
-	CInstance* global_instance = nullptr;
-	if (!AurieSuccess(g_ModuleInterface->GetGlobalInstance(&global_instance)))
-	{
-		return original(
-			Self,
-			Other,
-			Result,
-			ArgumentCount,
-			Arguments
-		);
-	}
-
 	if (rain_days == 0)
 		return original(
 			Self,
@@ -113,7 +87,6 @@ RValue& StartWeatherEvent(
 	RValue weather = 1;
 	Arguments[0] = &weather;
 	rain_days -= 1;
-	g_ModuleInterface->Print(CM_LIGHTGREEN, "Rainy days left: %i", rain_days);
 
 	return original(
 		Self,
@@ -140,17 +113,6 @@ RValue& WeatherTomorrow(
 {
 	const auto original = reinterpret_cast<PFUNC_YYGMLScript>(MmGetHookTrampoline(g_ArSelfModule, "WeatherTomorrow"));
 
-	CInstance* global_instance = nullptr;
-	if (!AurieSuccess(g_ModuleInterface->GetGlobalInstance(&global_instance)))
-	{
-		return original(
-			Self,
-			Other,
-			Result,
-			ArgumentCount,
-			Arguments
-		);
-	}
 
 
 	original(
@@ -178,47 +140,115 @@ RValue& WeatherTomorrow(
 	return Result;
 }
 
-void ModifyMana(CInstance* Self, CInstance* Other, int value)
+
+RValue& CastGrowthSpell(
+	IN CInstance* Self,
+	IN CInstance* Other,
+	OUT RValue& Result,
+	IN double Range
+)
 {
-	CScript* gml_script_modify_mana = nullptr;
-	g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_modify_mana@Ari@Ari",
-		(PVOID*)&gml_script_modify_mana
-	);
+	CRoom* current_room = nullptr;
+	if (!AurieSuccess(g_ModuleInterface->GetCurrentRoomData(current_room)))
+	{
+		g_ModuleInterface->Print(CM_RED, "Couldn't get the current room using YYTK!");
+	}
 
-	RValue result;
-	RValue mana_modifier = value;
-	RValue* mana_modifier_ptr = &mana_modifier;
+	double xPos = Other->ToRValue().ToRefMap()["_xx"]->ToDouble() / 8;
+	double yPos = Other->ToRValue().ToRefMap()["_yy"]->ToDouble() / 8;
 
-	gml_script_modify_mana->m_Functions->m_ScriptFunction(
-		Self,
-		Other,
-		result,
-		1,
-		{ &mana_modifier_ptr }
-	);
+	for (
+		CInstance* inst = current_room->GetMembers().m_ActiveInstances.m_First;
+		inst != nullptr;
+		inst = inst->GetMembers().m_Flink
+		)
+	{
+		auto map = inst->ToRValue().ToRefMap();
+		if (!map.contains("node"))
+			continue;
+
+		RValue* nodeValue = map["node"];
+		if (!nodeValue || nodeValue->GetKindName() != "struct")
+			continue;
+
+		auto nodeRefMap = nodeValue->ToRefMap();
+		if (!nodeRefMap.contains("prototype"))
+			continue;
+
+		RValue* protoVal = nodeRefMap["prototype"];
+		if (!protoVal || protoVal->GetKindName() != "struct")
+			continue;
+
+		auto protoMap = protoVal->ToRefMap();
+		if (!protoMap.contains("is_plant") || !protoMap["is_plant"]->ToBoolean())
+			continue;
+
+		if (!nodeRefMap.contains("stage"))
+			continue;
+
+		// Position & distance calculation
+		double structX = nodeRefMap["top_left_x"]->ToDouble() + 1;
+		double structY = nodeRefMap["top_left_y"]->ToDouble() + 1;
+		double dx = round(abs(structX - xPos) + 0.5);
+		double dy = round(abs(structY - yPos) + 0.5);
+		g_ModuleInterface->Print(CM_LIGHTGREEN, "Range: %f %f %f", Range, dx, dy);
+		if (dx > Range || dy > Range)
+			continue;
+
+		// Get the node from the instance of the crop
+		auto innerMap = inst->ToRValue().ToRefMap();
+		if (!innerMap.contains("node"))
+			continue;
+
+		RValue* nodeVal = innerMap["node"];
+		if (!nodeVal || nodeVal->GetKindName() != "struct")
+			continue;
+
+		// Prepare script call
+		RValue boolValue = false;
+		RValue result;
+		RValue* args[2] = { nodeVal, &boolValue };
+
+		// Get the script using the YYTK Interface
+		CScript* gml_script_level_up_crop = nullptr;
+		Aurie::AurieStatus st = g_ModuleInterface->GetNamedRoutinePointer(
+			"gml_Script_level_up_crop",
+			reinterpret_cast<PVOID*>(&gml_script_level_up_crop)
+		);
+		// Did we get the script successfully?
+		if (!AurieSuccess(st))
+			continue;
+
+		// Call gml_Script_level_up_crop
+		gml_script_level_up_crop->m_Functions->m_ScriptFunction(
+			Self,
+			Other,
+			Result,
+			2,
+			args
+		);
+	}
+	return Result;
 }
 
-RValue GetCurrentMana(CInstance* Self, CInstance* Other)
+RValue& CastIntenseGrowthSpell(
+	IN CInstance* Self,
+	IN CInstance* Other,
+	OUT RValue& Result
+)
 {
-	CScript* gml_script_get_mana = nullptr;
-	g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_get_mana@Ari@Ari",
-		(PVOID*)&gml_script_get_mana
-	);
+	RValue current_mana = Ari::Ari::GetCurrentMana();
+	if (current_mana.ToInt64() < (2 + intensity))
+	{
+		InfoToastsMenu::InfoToastsMenu::CreateNotification(DECREASED_INTENSITY);
+		intensity = (current_mana.ToInt64() - 2);
+		//g_ModuleInterface->Print(CM_LIGHTGREEN, "Set intensity to: %i", intensity);
+	}
 
-	RValue current_mana;
-	gml_script_get_mana->m_Functions->m_ScriptFunction(
-		Self,
-		Other,
-		current_mana,
-		0,
-		nullptr
-	);
-
-	return current_mana;
+	Ari::Ari::ModifyMana(static_cast<int>(-1 * intensity));
+	CastGrowthSpell(Self, Other, Result, intensity * 2 + 1.0);
+	return Result;
 }
-
 
 RValue& CastSpellCallback(
 	IN CInstance* Self,
@@ -230,17 +260,48 @@ RValue& CastSpellCallback(
 {
 	const auto original = reinterpret_cast<PFUNC_YYGMLScript>(MmGetHookTrampoline(g_ArSelfModule, "CastSpellCallback"));
 
-	CInstance* global_instance = nullptr;
-	if (!AurieSuccess(g_ModuleInterface->GetGlobalInstance(&global_instance)))
+	RValue current_mana = Ari::Ari::GetCurrentMana();
+
+
+	if (Arguments[0]->ToInt64() == 2)
+		return CastIntenseGrowthSpell(Self, Other, Result);
+
+	if (Arguments[0]->ToInt64() == 3)
 	{
-		return original(
+		original(
 			Self,
 			Other,
 			Result,
 			ArgumentCount,
 			Arguments
 		);
+		if (current_mana.ToInt64() < (4 + intensity))
+		{
+			InfoToastsMenu::InfoToastsMenu::CreateNotification(DECREASED_INTENSITY);
+			intensity = current_mana.ToInt64() - 4;
+			g_ModuleInterface->Print(CM_LIGHTGREEN, "Set intensity to: %i", intensity);
+		}
+		Ari::Ari::ModifyMana(static_cast<int>(-1 * intensity));
+		rain_days = (intensity + 1);
+		g_ModuleInterface->Print(CM_LIGHTGREEN, "It will rain for %i days. %i days come from the intensity of the casted spell.", rain_days, intensity);
 	}
+	
+
+
+
+	return Result;
+}
+
+RValue& GrowCropCallback(
+	IN CInstance* Self,
+	IN CInstance* Other,
+	OUT RValue& Result,
+	IN int ArgumentCount,
+	IN RValue** Arguments
+)
+{
+	const auto original = reinterpret_cast<PFUNC_YYGMLScript>(MmGetHookTrampoline(g_ArSelfModule, "GrowCropCallback"));
+
 
 	original(
 		Self,
@@ -250,29 +311,13 @@ RValue& CastSpellCallback(
 		Arguments
 	);
 
-	RValue current_mana = GetCurrentMana((global_instance->GetRefMember("__ari"))->ToInstance(), Self);
-	
-	
-	if (Arguments[0]->ToInt64() == 3)
-	{
-		if (current_mana.ToInt64() < (4 + intensity))
-		{
-			CreateNotification(DECREASED_INTENSITY, Self, Other);
-			intensity = current_mana.ToInt64() - 4;
-			g_ModuleInterface->Print(CM_LIGHTGREEN, "Set intensity to: %i", intensity);
-		}
-		ModifyMana((global_instance->GetRefMember("__ari"))->ToInstance(), Self, static_cast<int>(-1 * intensity));
-		rain_days = (intensity + 1);
-		g_ModuleInterface->Print(CM_LIGHTGREEN, "It will rain for %i days. %i days come from the intensity of the casted spell.", rain_days, intensity);
-	}
-	//g_ModuleInterface->Print(CM_LIGHTGREEN, "castSpell: %i", ArgumentCount);
-	//g_ModuleInterface->Print(CM_LIGHTGREEN, "castSpell: %i", Arguments[0]->ToInt64());
-	
-
 
 
 	return Result;
 }
+
+
+
 
 
 
@@ -295,7 +340,7 @@ EXPORTED AurieStatus ModuleInitialize(
 		g_ModuleInterface->PrintError(
 			__FILE__,
 			__LINE__,
-			"[Forecast v%s] Failed to get YYTK_Main interface! Reason: %s. Is YYToolkit installed?",
+			"[Intense Spells v%s] Failed to get YYTK_Main interface! Reason: %s. Is YYToolkit installed?",
 			VERSION,
 			AurieStatusToString(last_status)
 		);
@@ -303,168 +348,42 @@ EXPORTED AurieStatus ModuleInitialize(
 		return last_status;
 	}
 
-
-	CScript* start_weather_event = nullptr;
-	last_status = g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_start_new_weather_event@WeatherManager@Weather",
-		reinterpret_cast<PVOID*>(&start_weather_event)
-	);
+	last_status = g_ModuleInterface->GetGlobalInstance(&global_instance);
 
 	if (!AurieSuccess(last_status))
 	{
 		g_ModuleInterface->PrintError(
 			__FILE__,
 			__LINE__,
-			"[Forecast v%s] Failed to find gml_Script_start_new_weather_event@WeatherManager@Weather! Reason: %s",
+			"[Intense Spells v%s] Failed to get the global instance! Reason: %s.",
 			VERSION,
 			AurieStatusToString(last_status)
 		);
-
-		return last_status;
 	}
 
-	last_status = MmCreateHook(
-		g_ArSelfModule,
-		"StartWeatherEvent",
-		start_weather_event->m_Functions->m_ScriptFunction,
-		StartWeatherEvent,
-		nullptr
-	);
+	RegisterHook("gml_Script_start_new_weather_event@WeatherManager@Weather", "StartWeatherEvent", StartWeatherEvent);
+	//RegisterHook("gml_Script_node_index_for_cell@Grid@Grid", "SeletCellCallback", SeletCellCallback);
+	//RegisterHook("gml_Script_pick_node", "FindNodeCallback", FindNodeCallback);
+	//RegisterHook("gml_Script_pick_axe@anon@83430@AriFsm@AriFsm", "PickaxeCallback", PickaxeCallback);
+	RegisterHook("gml_Script_weather_tomorrow", "WeatherTomorrow", WeatherTomorrow);
+	RegisterHook("gml_Script_cast_spell", "CastSpellCallback", CastSpellCallback);
+	RegisterHook("gml_Script_level_up_crop", "GrowCropCallback", GrowCropCallback);
+	//RegisterHook("gml_Script_set_to_item@CraftingMenu@CraftingMenu", "CraftingTableSetToItemCallback", CraftingTableSetToItemCallback);
+	//RegisterHook("gml_Script_select_category@CraftingMenu@CraftingMenu", "SelectCategory", SelectCategory);
+	//RegisterHook("gml_Script_on_close@CraftingMenu@CraftingMenu", "CloseCraftingMenuCallback", CloseCraftingMenuCallback);
 
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to hook gml_Script_start_new_weather_event@WeatherManager@Weather! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
-	CScript* weather_tomorrow = nullptr;
-	last_status = g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_weather_tomorrow",
-		reinterpret_cast<PVOID*>(&weather_tomorrow)
-	);
-
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to find gml_Script_weather_tomorrow! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
-	last_status = MmCreateHook(
-		g_ArSelfModule,
-		"WeatherTomorrow",
-		weather_tomorrow->m_Functions->m_ScriptFunction,
-		WeatherTomorrow,
-		nullptr
-	);
-
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to hook gml_Script_weather_tomorrow! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
-	CScript* cast_spell = nullptr;
-	last_status = g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_cast_spell",
-		reinterpret_cast<PVOID*>(&cast_spell)
-	);
-
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to find gml_Script_cast_spell! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
-	last_status = MmCreateHook(
-		g_ArSelfModule,
-		"CastSpellCallback",
-		cast_spell->m_Functions->m_ScriptFunction,
-		CastSpellCallback,
-		nullptr
-	);
-
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to hook gml_Script_cast_spell! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
+	//gml_Script_anon@4732@cast_spell@Spells => SoundEffect (String argument)
+	//gml_Script_close_and_cast@SpellcastingMenu@SpellcastingMenu => Didn't manage to trigger it
+	//gml_Script_anon@170@close_and_cast@SpellcastingMenu@SpellcastingMenu => Didn't manage to trigger it
+	//gml_Script_select_spell@SpellcastingMenu@SpellcastingMenu => 1 Argument, number = slot
+	// gml_Script_load_spells => 0 Arguments, Result is an array of structs representing the spells
+	//
+	//RegisterHook("gml_Script_write_crop_to_location", "Exchanger", Exchanger);
 
 	// Taken from Time of Mistria
-	CScript* clock_update_script = nullptr;
-	last_status = g_ModuleInterface->GetNamedRoutinePointer(
-		"gml_Script_update@Clock@Clock",
-		reinterpret_cast<PVOID*>(&clock_update_script)
-	);
+	RegisterHook("gml_Script_update@Clock@Clock", "ClockUpdate", UpdateClock);
 
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to find gml_Script_update@Clock@Clock! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
-
-	last_status = MmCreateHook(
-		g_ArSelfModule,
-		"ClockUpdate",
-		clock_update_script->m_Functions->m_ScriptFunction,
-		UpdateClock,
-		nullptr
-	);
-
-	if (!AurieSuccess(last_status))
-	{
-		g_ModuleInterface->PrintError(
-			__FILE__,
-			__LINE__,
-			"[Forecast v%s] Failed to set a hook on gml_Script_update@Clock@Clock! Reason: %s",
-			VERSION,
-			AurieStatusToString(last_status)
-		);
-
-		return last_status;
-	}
+	
 
 	return AURIE_SUCCESS;
 }
