@@ -191,7 +191,6 @@ RValue& CastGrowthSpell(
 		double structY = nodeRefMap["top_left_y"]->ToDouble() + 1;
 		double dx = round(abs(structX - xPos) + 0.5);
 		double dy = round(abs(structY - yPos) + 0.5);
-		g_ModuleInterface->Print(CM_LIGHTGREEN, "Range: %f %f %f", Range, dx, dy);
 		if (dx > Range || dy > Range)
 			continue;
 
@@ -246,7 +245,9 @@ RValue& CastIntenseGrowthSpell(
 	}
 
 	Ari::Ari::ModifyMana(static_cast<int>(-1 * intensity));
-	CastGrowthSpell(Self, Other, Result, intensity * 2 + 1.0);
+	int range = intensity * 2 + 1.0;
+	range += intensity ? 1 : 0;
+	CastGrowthSpell(Self, Other, Result, range);
 	return Result;
 }
 
